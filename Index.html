@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+contract ChronosPerpetualSettlement {
+    enum PositionState { Active, Closed }
+
+    struct ClearingPosition {
+        address payable trader;
+        uint256 marginETH;
+        uint256 leverageFactor;
+        uint256 entryTimestamp;
+        PositionState state;
+        bytes32 marketId;
+    }
+
+    address payable public immutable clearingMaster;
+    string public protocolDescriptor;
+    uint256 public fundingRateFactorBps; // 100 = 1%
+    uint256 public positionCounter;
+    uint256 public totalClearedMargin;
+    uint256 public insuranceFundBalance;
+    bool public isClearingPaused;
+
+    mapping(bytes32 => bool) public activeMarkets;
+    mapping(uint256 => ClearingPosition) public positions;
+
+    event MarketRegistered(bytes32 indexed marketId);
+    event FundingFactorAdjusted(uint256 newFactorBps);
+    event PositionClosed(uint256 indexed positionId, uint256 payoutAmount);
+    event TradingRebateClaimed(address indexed trader, uint256 amount);
+    event InsuranceFundFunded(address indexed master, uint256 amount);
+    event ReservesDrained(address indexed master, uint256 amount);
+    event FundingSettled(address indexed trader, uint256 grossInput, uint256 netSettled);
+    event MarginIncreased(uint256 indexed positionId, uint256 addedAmount);
+    event PositionOpened(uint256 indexed positionId, address indexed trader, uint256 margin);
+    event ClearingPauseToggled(bool isPaused);
+    event DescriptorUpdated(string newDescriptor);
+    event ExcessMarginWithdrawn(uint256 indexed positionId, uint256 amount);
+
+    modifier onlyMaster() {
+        require(msg.sender == clearingMaster, "ChronosClearing: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isClearingPaused, "ChronosClearing: Clearing paused");
+        _;
+    }
+
+    constructor() {
+        clearingMaster = payable(msg.sender);
+        protocolDescriptor = "Chronos Base Perpetual Settlement Clearing Core v1";
+        fundingRateFactorBps = 100; // 1%
+        isClearingPaused = false;
+        activeMarkets[0x424153455f504552505f4554485f555344000000000000000000000000000000] = true;
+    }
+
+    // 1. addSupportedMarket
+    function addSupportedMarket(bytes32 marketId) external onlyMaster {
+        require(!activeMarkets[marketId], "ChronosClearing: Market already added");
+        activeMarkets[marketId] = true;
+        emit MarketRegistered(marketId);
+    }
+
+    // 2. adjustFundingRateFactor
+    function adjustFundingRateFactor(uint256 newFactorBps) external onlyMaster {
+        require(newFactorBps <= 500, "ChronosClearing: Factor cap 5%");
+        fundingRateFactorBps = newFactorBps;
+        emit FundingFactorAdjusted(newFactorBps);
+    }
+
+    // 3. closeClearingPosition
+    function closeClearingPosition(uint256 positionId) external {
+        ClearingPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ChronosClearing: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == clearingMaster, "ChronosClearing: Unauthorized");
+        require(p.state == PositionState.Active, "ChronosClearing: Not active");
+
+        p.state = PositionState.Closed;
+        uint256 refund = p.marginETH;
+        p.marginETH = 0;
+        totalClearedMargin -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = p.trader.call{value: refund}("");
+            require(sent, "ChronosClearing: Margin payout failed");
+        }
+
+        emit PositionClosed(positionId, refund);
+    }
+
+    // 4. collectTradingRebate
+    function collectTradingRebate() external onlyMaster {
+        uint256 rebate = insuranceFundBalance;
+        require(rebate > 0, "ChronosClearing: Zero insurance funds");
+
+        insuranceFundBalance = 0;
+        (bool sent, ) = clearingMaster.call{value: rebate}("");
+        require(sent, "ChronosClearing: Rebate transfer failed");
+
+        emit TradingRebateClaimed(clearingMaster, rebate);
+    }
+
+    // 5. depositInsuranceFund
+    function depositInsuranceFund() external payable onlyMaster {
+        require(msg.value > 0, "ChronosClearing: Zero deposit");
+        insuranceFundBalance += msg.value;
+        emit InsuranceFundFunded(msg.sender, msg.value);
+    }
+
+    // 6. drainRemainingReserves
+    function drainRemainingReserves() external onlyMaster {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "ChronosClearing: Zero contract balance");
+
+        totalClearedMargin = 0;
+        insuranceFundBalance = 0;
+
+        (bool sent, ) = clearingMaster.call{value: balance}("");
+        require(sent, "ChronosClearing: Sweep failed");
+
+        emit ReservesDrained(clearingMaster, balance);
+    }
+
+    // 7. executeFundingSettlement
+    function executeFundingSettlement() external payable whenNotPaused {
+        require(msg.value > 0, "ChronosClearing: Zero settlement amount");
+
+        uint256 fee = (msg.value * fundingRateFactorBps) / 10000;
+        uint256 netSettled = msg.value - fee;
+        insuranceFundBalance += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netSettled}("");
+        require(sent, "ChronosClearing: Net return failed");
+
+        emit FundingSettled(msg.sender, msg.value, netSettled);
+    }
+
+    // 8. increasePositionMargin
+    function increasePositionMargin(uint256 positionId) external payable whenNotPaused {
+        ClearingPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ChronosClearing: Invalid ID");
+        require(p.state == PositionState.Active, "ChronosClearing: Position closed");
+        require(msg.value > 0, "ChronosClearing: Zero margin top-up");
+
+        p.marginETH += msg.value;
+        totalClearedMargin += msg.value;
+
+        emit MarginIncreased(positionId, msg.value);
+    }
+
+    // 9. openClearingPosition
+    function openClearingPosition(bytes32 marketId, uint256 leverageFactor) external payable whenNotPaused returns (uint256) {
+        require(activeMarkets[marketId], "ChronosClearing: Market not supported");
+        require(msg.value > 0, "ChronosClearing: Margin required");
+        require(leverageFactor >= 1 && leverageFactor <= 50, "ChronosClearing: Invalid leverage");
+
+        positionCounter++;
+        positions[positionCounter] = ClearingPosition({
+            trader: payable(msg.sender),
+            marginETH: msg.value,
+            leverageFactor: leverageFactor,
+            entryTimestamp: block.timestamp,
+            state: PositionState.Active,
+            marketId: marketId
+        });
+
+        totalClearedMargin += msg.value;
+        emit PositionOpened(positionCounter, msg.sender, msg.value);
+        return positionCounter;
+    }
+
+    // 10. toggleClearingPause
+    function toggleClearingPause(bool isPaused) external onlyMaster {
+        isClearingPaused = isPaused;
+        emit ClearingPauseToggled(isPaused);
+    }
+
+    // 11. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyMaster {
+        require(bytes(newDescriptor).length > 0, "ChronosClearing: Empty string");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 12. withdrawExcessMargin
+    function withdrawExcessMargin(uint256 positionId, uint256 amount) external {
+        ClearingPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ChronosClearing: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == clearingMaster, "ChronosClearing: Unauthorized");
+        require(p.state == PositionState.Active, "ChronosClearing: Position closed");
+        require(p.marginETH >= amount && amount > 0, "ChronosClearing: Insufficient margin");
+
+        p.marginETH -= amount;
+        totalClearedMargin -= amount;
+
+        (bool sent, ) = p.trader.call{value: amount}("");
+        require(sent, "ChronosClearing: Margin withdrawal failed");
+
+        emit ExcessMarginWithdrawn(positionId, amount);
+    }
+
+    // Чтение информации о позиции
+    function getPositionDetails(uint256 positionId) external view returns (
+        address trader,
+        uint256 marginETH,
+        uint256 leverageFactor,
+        uint256 entryTimestamp,
+        PositionState state,
+        bytes32 marketId
+    ) {
+        ClearingPosition memory p = positions[positionId];
+        return (p.trader, p.marginETH, p.leverageFactor, p.entryTimestamp, p.state, p.marketId);
+    }
+}
